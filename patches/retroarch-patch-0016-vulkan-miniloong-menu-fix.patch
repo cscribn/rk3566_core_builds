@@ -1,0 +1,337 @@
+diff --git a/gfx/drivers/vulkan.c b/gfx/drivers/vulkan.c
+index ca45cfc050..0e592093ed 100644
+--- a/gfx/drivers/vulkan.c
++++ b/gfx/drivers/vulkan.c
+@@ -17,6 +17,8 @@
+ #include <stdint.h>
+ #include <math.h>
+ #include <string.h>
++#include <stdio.h>
++#include <dirent.h>
+ 
+ #include <retro_assert.h>
+ #include <encodings/utf.h>
+@@ -286,6 +288,12 @@ typedef struct vk
+       VkRect2D scissor;    /* int32_t alignment */
+    } tracker;
+    uint32_t flags;
++
++   /* MINILOONG: true only while rendering gfx_widgets notifications.
++    * Widget backgrounds use per-draw pixel viewports, which must be
++    * physically remapped for the portrait LCD independently of the
++    * already-correct font/text path. */
++   bool miniloong_widget_pass;
+ } vk_t;
+ 
+ typedef struct
+@@ -1408,12 +1416,63 @@ static void gfx_display_vk_draw(gfx_display_ctx_draw_t *draw,
+    if (!color)
+       color                       = &vk_colors[0];
+ 
+-   vk->vk_vp.x                    = draw->x;
+-   vk->vk_vp.y                    = vk->context->swapchain_height - draw->y - draw->height;
+-   vk->vk_vp.width                = draw->width;
+-   vk->vk_vp.height               = draw->height;
+-   vk->vk_vp.minDepth             = 0.0f;
+-   vk->vk_vp.maxDepth             = 1.0f;
++   if (vk->miniloong_widget_pass)
++   {
++      /* gfx_widgets backgrounds/quads are positioned with an absolute
++       * pixel viewport. A matrix rotation cannot fix that viewport itself.
++       *
++       * Convert the original rectangle to normalized screen coordinates,
++       * rotate that rectangle 270 degrees, then convert it back to the
++       * physical 720x960 swapchain. This changes only graphical widget
++       * quads; the font/text renderer is intentionally left alone. */
++      float screen_w = (float)vk->context->swapchain_width;
++      float screen_h = (float)vk->context->swapchain_height;
++      float src_x    = (float)draw->x;
++      float src_y    = screen_h - (float)draw->y - (float)draw->height;
++      float src_w    = (float)draw->width;
++      float src_h    = (float)draw->height;
++
++      float u  = src_x / screen_w;
++      float v  = src_y / screen_h;
++      float uw = src_w / screen_w;
++      float vh = src_h / screen_h;
++
++      /* MINILOONG widget viewport remap.
++       *
++       * Empirical placement from the previous tests:
++       *   - y' = x keeps the notification on the correct right-hand side.
++       *   - x' = 1-(y+h) placed it at the top.
++       *
++       * Flip only the top/bottom mapping while preserving the known-good
++       * right-side mapping. Width/height remain swapped for the portrait
++       * physical framebuffer.
++       */
++      /* MINILOONG widget placement, derived from device testing:
++       *
++       *   vk_vp.x controls top/bottom after the 270-degree presentation
++       *   rotation.  x = v gives the confirmed bottom placement (v7).
++       *
++       *   vk_vp.y controls left/right after rotation.  Mirroring y moves
++       *   the widget from the confirmed right side to the left side.
++       *
++       * Keep the already-correct swapped widget dimensions unchanged.
++       */
++      vk->vk_vp.x      = v * screen_w;
++      vk->vk_vp.y      = (1.0f - (u + uw)) * screen_h;
++      vk->vk_vp.width  = vh * screen_w;
++      vk->vk_vp.height = uw * screen_h;
++   }
++   else
++   {
++      vk->vk_vp.x      = draw->x;
++      vk->vk_vp.y      = vk->context->swapchain_height
++                       - draw->y - draw->height;
++      vk->vk_vp.width  = draw->width;
++      vk->vk_vp.height = draw->height;
++   }
++
++   vk->vk_vp.minDepth = 0.0f;
++   vk->vk_vp.maxDepth = 1.0f;
+ 
+    vk->tracker.dirty             |= VULKAN_DIRTY_DYNAMIC_BIT;
+ 
+@@ -1429,8 +1488,30 @@ static void gfx_display_vk_draw(gfx_display_ctx_draw_t *draw,
+       pv->x       = *vertex++;
+       /* Y-flip. Vulkan is top-left clip space */
+       pv->y       = 1.0f - (*vertex++);
+-      pv->tex_x   = *tex_coord++;
+-      pv->tex_y   = *tex_coord++;
++
++      if (vk->miniloong_widget_pass &&
++          texture != &vk->display.blank_texture)
++      {
++         /* MINILOONG: keep textured gfx_widget quads in their already
++          * corrected v9 viewport, and rotate only the artwork inside the
++          * quad. Rotating the geometry matrix moved small notification icons
++          * outside their viewport and made them disappear.
++          *
++          * Rotate texture coordinates 270 degrees:
++          *   u' = 1 - v
++          *   v' = u
++          */
++         float tex_u = *tex_coord++;
++         float tex_v = *tex_coord++;
++         pv->tex_x = 1.0f - tex_v;
++         pv->tex_y = tex_u;
++      }
++      else
++      {
++         pv->tex_x = *tex_coord++;
++         pv->tex_y = *tex_coord++;
++      }
++
+       pv->color.r = *color++;
+       pv->color.g = *color++;
+       pv->color.b = *color++;
+@@ -3978,16 +4059,91 @@ static bool vulkan_set_shader(void *data,
+    return true;
+ }
+ 
++/* MINILOONG Pocket1 Vulkan-only display orientation quirk.
++ *
++ * The built-in LCD is a native 720x960 portrait panel, while dArkOS uses
++ * RetroArch in landscape orientation. GLES already handles this correctly on
++ * this device, so keep this correction local to the Vulkan video driver.
++ *
++ * HDMI is intentionally excluded: if any DRM HDMI connector is connected,
++ * use stock RetroArch Vulkan orientation.
++ */
++static bool vulkan_miniloong_internal_panel(void)
++{
++   FILE *file;
++   char device[128];
++   DIR *dir;
++   struct dirent *entry;
++   bool is_miniloong = false;
++
++   file = fopen("/home/ark/.config/.DEVICE", "r");
++   if (!file)
++      return false;
++
++   if (fgets(device, sizeof(device), file) && strstr(device, "MINILOONG"))
++      is_miniloong = true;
++
++   fclose(file);
++
++   if (!is_miniloong)
++      return false;
++
++   dir = opendir("/sys/class/drm");
++   if (dir)
++   {
++      while ((entry = readdir(dir)) != NULL)
++      {
++         char status_path[512];
++         char status[32];
++
++         if (!strstr(entry->d_name, "HDMI"))
++            continue;
++
++         snprintf(status_path, sizeof(status_path),
++               "/sys/class/drm/%s/status", entry->d_name);
++
++         file = fopen(status_path, "r");
++         if (!file)
++            continue;
++
++         if (fgets(status, sizeof(status), file))
++         {
++            status[strcspn(status, "\r\n")] = '\0';
++            if (strcmp(status, "connected") == 0)
++            {
++               fclose(file);
++               closedir(dir);
++               return false;
++            }
++         }
++
++         fclose(file);
++      }
++      closedir(dir);
++   }
++
++   return true;
++}
++
+ static void vulkan_set_projection(vk_t *vk,
+       struct video_ortho *ortho, bool allow_rotate)
+ {
+    float radians, cosine, sine;
++   float menu_radians, menu_cosine, menu_sine;
++   unsigned display_rotation = vulkan_miniloong_internal_panel() ? 270 : 0;
++   unsigned content_rotation = (vk->rotation + display_rotation) % 360;
+    static math_matrix_4x4 rot     = {
+       {  0.0f,     0.0f,    0.0f,    0.0f ,
+          0.0f,     0.0f,    0.0f,    0.0f ,
+          0.0f,     0.0f,    0.0f,    0.0f ,
+          0.0f,     0.0f,    0.0f,    1.0f }
+    };
++   math_matrix_4x4 menu_rot = {
++      {  1.0f,     0.0f,    0.0f,    0.0f ,
++         0.0f,     1.0f,    0.0f,    0.0f ,
++         0.0f,     0.0f,    1.0f,    0.0f ,
++         0.0f,     0.0f,    0.0f,    1.0f }
++   };
+    math_matrix_4x4 trn     = {
+       {  1.0f,     0.0f,    0.0f,    0.0f ,
+          0.0f,     1.0f,    0.0f,    0.0f ,
+@@ -4003,18 +4159,45 @@ static void vulkan_set_projection(vk_t *vk,
+          0.0f,     0.0f,    1.0f,    0.0f ,
+          0.0f,     0.0f,    0.0f,    1.0f }
+    };
++   math_matrix_4x4 menu_tmp = {
++      {  1.0f,     0.0f,    0.0f,    0.0f ,
++         0.0f,     1.0f,    0.0f,    0.0f ,
++         0.0f,     0.0f,    1.0f,    0.0f ,
++         0.0f,     0.0f,    0.0f,    1.0f }
++   };
++   /* MINILOONG menu correction:
++    * The menu now uses the complete physical 720x960 Vulkan viewport.
++    * After the 270-degree menu rotation, those physical axes naturally
++    * correspond to the desired logical 960x720 space, so no additional
++    * non-uniform aspect scaling is required. */
++   math_matrix_4x4 menu_scale = {
++      {  1.0f,      0.0f,      0.0f,    0.0f ,
++         0.0f,      1.0f,      0.0f,    0.0f ,
++         0.0f,      0.0f,      1.0f,    0.0f ,
++         0.0f,      0.0f,      0.0f,    1.0f }
++   };
++   math_matrix_4x4 menu_scaled = {
++      {  1.0f,     0.0f,    0.0f,    0.0f ,
++         0.0f,     1.0f,    0.0f,    0.0f ,
++         0.0f,     0.0f,    1.0f,    0.0f ,
++         0.0f,     0.0f,    0.0f,    1.0f }
++   };
+ 
+-   /* Calculate projection. */
++   /* Calculate the normal, unrotated projection. */
+    matrix_4x4_ortho(vk->mvp_no_rot, ortho->left, ortho->right,
+          ortho->bottom, ortho->top, ortho->znear, ortho->zfar);
+ 
+-   if (!allow_rotate)
++   /* Content keeps RetroArch/core rotation, with the MINILOONG physical
++    * display correction added independently. */
++   if (!allow_rotate && !display_rotation)
+       tmp = vk->mvp_no_rot;
+    else
+    {
+-      radians                 = M_PI * vk->rotation / 180.0f;
+-      cosine                  = cosf(radians);
+-      sine                    = sinf(radians);
++      unsigned rotation = allow_rotate ? content_rotation : display_rotation;
++
++      radians                  = M_PI * rotation / 180.0f;
++      cosine                   = cosf(radians);
++      sine                     = sinf(radians);
+       MAT_ELEM_4X4(rot, 0, 0) = cosine;
+       MAT_ELEM_4X4(rot, 0, 1) = -sine;
+       MAT_ELEM_4X4(rot, 1, 0) = sine;
+@@ -4023,8 +4206,31 @@ static void vulkan_set_projection(vk_t *vk,
+    }
+    matrix_4x4_multiply(vk->mvp, trn, tmp);
+ 
+-   /* Required for translate_x+y / negative offsets to also work in RGUI */
+-   matrix_4x4_multiply(vk->mvp_menu, trn, vk->mvp_no_rot);
++   /* The menu must receive only the physical MINILOONG correction. It must
++    * never inherit core/content rotation. */
++   if (display_rotation)
++   {
++      menu_radians                      = M_PI * display_rotation / 180.0f;
++      menu_cosine                       = cosf(menu_radians);
++      menu_sine                         = sinf(menu_radians);
++      MAT_ELEM_4X4(menu_rot, 0, 0)      = menu_cosine;
++      MAT_ELEM_4X4(menu_rot, 0, 1)      = -menu_sine;
++      MAT_ELEM_4X4(menu_rot, 1, 0)      = menu_sine;
++      MAT_ELEM_4X4(menu_rot, 1, 1)      = menu_cosine;
++      /* MINILOONG menu-only correction. Aspect compensation is combined
++       * with a uniform 3/4 fit scale so the correctly proportioned menu
++       * remains centered and fits within the physical panel.
++       * Game/content projection is untouched. */
++      matrix_4x4_multiply(menu_scaled, menu_scale, vk->mvp_no_rot);
++      matrix_4x4_multiply(menu_tmp, menu_rot, menu_scaled);
++      matrix_4x4_multiply(vk->mvp_menu, trn, menu_tmp);
++   }
++   else
++   {
++      /* Stock RetroArch behaviour. Required for translate_x+y / negative
++       * offsets to also work in RGUI. */
++      matrix_4x4_multiply(vk->mvp_menu, trn, vk->mvp_no_rot);
++   }
+ }
+ 
+ static void vulkan_set_rotation(void *data, unsigned rotation)
+@@ -4980,8 +5186,14 @@ static bool vulkan_frame(void *data, const void *frame,
+             settings_t *settings       = config_get_ptr();
+             bool menu_linear_filter    = settings->bools.menu_linear_filter;
+ 
+-            vulkan_set_viewport(vk, width, height, ((vk->flags &
+-                     VK_FLAG_MENU_FULLSCREEN) > 0), false);
++            /* MINILOONG: the Vulkan menu is rotated at presentation time.
++             * Use the complete physical swapchain viewport for the menu quad;
++             * otherwise the normal content/aspect viewport clips the rotated
++             * menu before it can fill the panel. This is menu-only and does
++             * not alter the game/content viewport. */
++            vulkan_set_viewport(vk, width, height,
++                  vulkan_miniloong_internal_panel() ||
++                  ((vk->flags & VK_FLAG_MENU_FULLSCREEN) > 0), false);
+ 
+             quad.pipeline              = vk->pipelines.alpha_blend;
+             quad.texture               = &vk->menu.textures[vk->menu.last_index];
+@@ -5023,7 +5235,13 @@ static bool vulkan_frame(void *data, const void *frame,
+ 
+ #ifdef HAVE_GFX_WIDGETS
+       if (widgets_active)
++      {
++         bool miniloong_widgets = vulkan_miniloong_internal_panel();
++
++         vk->miniloong_widget_pass = miniloong_widgets;
+          gfx_widgets_frame(video_info);
++         vk->miniloong_widget_pass = false;
++      }
+ #endif
+ 
+       /* End the render pass. We're done rendering to backbuffer now. */
